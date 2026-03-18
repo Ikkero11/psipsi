@@ -24,7 +24,7 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ========== КОНСТАНТЫ ==========
-ADMIN_ID = 123456789              # ⚠️ ЗАМЕНИТЕ НА СВОЙ ID
+ADMIN_ID = 7498442456             # ⚠️ ЗАМЕНИТЕ НА СВОЙ ID
 DB_NAME = "stress_bot.db"
 IMAGES_FOLDER = "images"
 MOON_PHOTOS_FOLDER = "moon_photos"
@@ -515,6 +515,7 @@ moon_disclaimers = [
 # ========== СОСТОЯНИЯ FSM ==========
 class Registration(StatesGroup):
     waiting_for_gender = State()
+    waiting_for_trial = State()        # <--- ЭТО СОСТОЯНИЕ ОБЯЗАТЕЛЬНО ДОЛЖНО БЫТЬ
 
 class TimeSetup(StatesGroup):
     waiting_for_poll = State()
@@ -539,7 +540,7 @@ class QuickTest(StatesGroup):
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)  # задаём часовой пояс для планировщика
+scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
 
 # ========== КЛАВИАТУРЫ ==========
 def gender_kb() -> ReplyKeyboardMarkup:
@@ -594,7 +595,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 resize_keyboard=True
             )
         )
-        await state.set_state(Registration.waiting_for_trial)
+        await state.set_state(Registration.waiting_for_trial)   # используем новое состояние
 
 @dp.message(Registration.waiting_for_gender)
 async def process_gender(message: types.Message, state: FSMContext):
@@ -616,7 +617,7 @@ async def process_gender(message: types.Message, state: FSMContext):
             resize_keyboard=True
         )
     )
-    await state.set_state(Registration.waiting_for_trial)
+    await state.set_state(Registration.waiting_for_trial)   # переходим к выбору пробного опроса
 
 @dp.message(Registration.waiting_for_trial)
 async def process_trial(message: types.Message, state: FSMContext):
@@ -630,7 +631,7 @@ async def process_trial(message: types.Message, state: FSMContext):
             parse_mode="Markdown",
             reply_markup=build_poll_kb()
         )
-    else:
+    elif message.text == "⏰ Позже":
         # Переходим к настройке времени
         await message.answer(
             "Хорошо, давай настроим время для ежедневного опроса.",
@@ -641,6 +642,8 @@ async def process_trial(message: types.Message, state: FSMContext):
             "Если хочешь настроить позже, отправь «позже»."
         )
         await state.set_state(TimeSetup.waiting_for_poll)
+    else:
+        await message.answer("Пожалуйста, выбери вариант из кнопок.")
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
