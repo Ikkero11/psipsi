@@ -24,7 +24,7 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ========== КОНСТАНТЫ ==========
-ADMIN_ID = 7498442456             # ⚠️ ЗАМЕНИТЕ НА СВОЙ ID
+ADMIN_ID = 123456789              # ⚠️ ЗАМЕНИТЕ НА СВОЙ ID
 DB_NAME = "stress_bot.db"
 IMAGES_FOLDER = "images"
 MOON_PHOTOS_FOLDER = "moon_photos"
@@ -52,6 +52,8 @@ if not image_files:
 # ========== БАЗА ДАННЫХ ==========
 def init_db():
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA journal_mode=WAL")  # Включаем WAL-режим для конкурентного доступа
+    conn.execute("PRAGMA busy_timeout=5000")  # Ждать до 5 секунд при блокировке
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -103,10 +105,11 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-    logging.info("✅ База данных инициализирована.")
+    logging.info("✅ База данных инициализирована (WAL mode).")
 
 def register_user(user_id: int, username: str, first_name: str):
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute(
         "INSERT OR IGNORE INTO users (user_id, username, first_name, registered) VALUES (?, ?, ?, ?)",
@@ -117,6 +120,7 @@ def register_user(user_id: int, username: str, first_name: str):
 
 def set_user_gender(user_id: int, gender: str):
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("UPDATE users SET gender = ? WHERE user_id = ?", (gender, user_id))
     conn.commit()
@@ -124,6 +128,7 @@ def set_user_gender(user_id: int, gender: str):
 
 def get_user_gender(user_id: int) -> Optional[str]:
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("SELECT gender FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -132,6 +137,7 @@ def get_user_gender(user_id: int) -> Optional[str]:
 
 def get_user_points(user_id: int) -> int:
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("SELECT points FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -140,6 +146,7 @@ def get_user_points(user_id: int) -> int:
 
 def add_points(user_id: int, points: int):
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (points, user_id))
     conn.commit()
@@ -148,6 +155,7 @@ def add_points(user_id: int, points: int):
 def init_daily_tasks(user_id: int):
     today = datetime.now(MOSCOW_TZ).date().isoformat()
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute(
         "INSERT OR IGNORE INTO daily_tasks (user_id, task_date) VALUES (?, ?)",
@@ -159,6 +167,7 @@ def init_daily_tasks(user_id: int):
 def update_task(user_id: int, task: str):
     today = datetime.now(MOSCOW_TZ).date().isoformat()
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute(f"UPDATE daily_tasks SET {task} = 1 WHERE user_id = ? AND task_date = ?", (user_id, today))
     if cur.rowcount == 0:
@@ -170,6 +179,7 @@ def update_task(user_id: int, task: str):
 def get_tasks_status(user_id: int) -> dict:
     today = datetime.now(MOSCOW_TZ).date().isoformat()
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute(
         "SELECT poll_done, breathing_done, quick_test_done FROM daily_tasks WHERE user_id = ? AND task_date = ?",
@@ -183,6 +193,7 @@ def get_tasks_status(user_id: int) -> dict:
 
 def has_previous_moods(user_id: int) -> bool:
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM moods WHERE user_id = ?", (user_id,))
     count = cur.fetchone()[0]
@@ -191,6 +202,7 @@ def has_previous_moods(user_id: int) -> bool:
 
 def set_first_poll_done(user_id: int):
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("UPDATE users SET first_poll_done = 1 WHERE user_id = ?", (user_id,))
     conn.commit()
@@ -210,6 +222,7 @@ def save_mood_with_details(user_id: int, answers: List[int], is_extra: bool = Fa
         zone = 'red'
 
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
 
     cur.execute("""
@@ -298,6 +311,7 @@ async def notify_user_red_streak(user_id: int, days: int):
 
 def get_user_stats(user_id: int) -> Tuple[int, int, List[Tuple[int, str]], List[Tuple[int, str]]]:
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("SELECT points, current_streak FROM users WHERE user_id = ?", (user_id,))
     user_row = cur.fetchone()
@@ -315,6 +329,7 @@ def get_user_stats(user_id: int) -> Tuple[int, int, List[Tuple[int, str]], List[
 
 def set_user_poll_time(user_id: int, poll_time: str):
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("UPDATE users SET poll_time = ? WHERE user_id = ?", (poll_time, user_id))
     conn.commit()
@@ -322,6 +337,7 @@ def set_user_poll_time(user_id: int, poll_time: str):
 
 def set_user_morning_time(user_id: int, morning_time: Optional[str]):
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("UPDATE users SET morning_time = ? WHERE user_id = ?", (morning_time, user_id))
     conn.commit()
@@ -329,6 +345,7 @@ def set_user_morning_time(user_id: int, morning_time: Optional[str]):
 
 def get_users_by_poll_time(current_time: str) -> List[int]:
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("SELECT user_id FROM users WHERE poll_time = ?", (current_time,))
     users = [row[0] for row in cur.fetchall()]
@@ -337,6 +354,7 @@ def get_users_by_poll_time(current_time: str) -> List[int]:
 
 def get_users_by_morning_time(current_time: str) -> List[int]:
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("SELECT user_id FROM users WHERE morning_time = ?", (current_time,))
     users = [row[0] for row in cur.fetchall()]
@@ -345,6 +363,7 @@ def get_users_by_morning_time(current_time: str) -> List[int]:
 
 def get_all_users() -> List[int]:
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("SELECT user_id FROM users")
     users = [row[0] for row in cur.fetchall()]
@@ -353,6 +372,7 @@ def get_all_users() -> List[int]:
 
 def get_admin_stats():
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM users")
     total_users = cur.fetchone()[0]
@@ -390,6 +410,7 @@ def get_admin_stats():
 def has_today_mood(user_id: int) -> bool:
     today = datetime.now(MOSCOW_TZ).date().isoformat()
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("SELECT id FROM moods WHERE user_id = ? AND date = ? AND is_extra = 0", (user_id, today))
     exists = cur.fetchone() is not None
@@ -399,6 +420,7 @@ def has_today_mood(user_id: int) -> bool:
 def can_take_breathing(user_id: int) -> bool:
     today = datetime.now(MOSCOW_TZ).date().isoformat()
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("SELECT last_breathing FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -411,6 +433,7 @@ def can_take_breathing(user_id: int) -> bool:
 def mark_breathing_done(user_id: int):
     today = datetime.now(MOSCOW_TZ).date().isoformat()
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("UPDATE users SET last_breathing = ? WHERE user_id = ?", (today, user_id))
     cur.execute("UPDATE users SET points = points + 5 WHERE user_id = ?", (user_id,))
@@ -420,6 +443,7 @@ def mark_breathing_done(user_id: int):
 
 def can_take_quick_test(user_id: int) -> bool:
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("SELECT last_quick_test FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -432,6 +456,7 @@ def can_take_quick_test(user_id: int) -> bool:
 
 def update_quick_test_time(user_id: int):
     conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("UPDATE users SET last_quick_test = ? WHERE user_id = ?", (datetime.now(MOSCOW_TZ).isoformat(), user_id))
     conn.commit()
@@ -515,7 +540,7 @@ moon_disclaimers = [
 # ========== СОСТОЯНИЯ FSM ==========
 class Registration(StatesGroup):
     waiting_for_gender = State()
-    waiting_for_trial = State()        # <--- ЭТО СОСТОЯНИЕ ОБЯЗАТЕЛЬНО ДОЛЖНО БЫТЬ
+    waiting_for_trial = State()
 
 class TimeSetup(StatesGroup):
     waiting_for_poll = State()
@@ -586,7 +611,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         await state.set_state(Registration.waiting_for_gender)
     else:
-        # Пол уже указан – предлагаем пробный опрос
         await message.answer(
             "Хочешь прямо сейчас пройти пробный вечерний опрос?\n"
             "Это займёт пару минут и покажет твой текущий уровень стресса.",
@@ -595,7 +619,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 resize_keyboard=True
             )
         )
-        await state.set_state(Registration.waiting_for_trial)   # используем новое состояние
+        await state.set_state(Registration.waiting_for_trial)
 
 @dp.message(Registration.waiting_for_gender)
 async def process_gender(message: types.Message, state: FSMContext):
@@ -617,12 +641,11 @@ async def process_gender(message: types.Message, state: FSMContext):
             resize_keyboard=True
         )
     )
-    await state.set_state(Registration.waiting_for_trial)   # переходим к выбору пробного опроса
+    await state.set_state(Registration.waiting_for_trial)
 
 @dp.message(Registration.waiting_for_trial)
 async def process_trial(message: types.Message, state: FSMContext):
     if message.text == "✅ Да":
-        # Запускаем вечерний опрос прямо сейчас
         await state.set_state(EveningPoll.q1)
         await state.update_data(answers=[], first_poll=True)
         q = PollQuestions.questions[0]
@@ -632,7 +655,6 @@ async def process_trial(message: types.Message, state: FSMContext):
             reply_markup=build_poll_kb()
         )
     elif message.text == "⏰ Позже":
-        # Переходим к настройке времени
         await message.answer(
             "Хорошо, давай настроим время для ежедневного опроса.",
             reply_markup=main_menu_kb()
@@ -892,7 +914,7 @@ async def scheduled_polls():
     for uid in users:
         await send_poll_to_user(uid)
 
-# ========== УТРЕННЯЯ РАССЫЛКА (ТОЛЬКО КАРТИНКИ) ==========
+# ========== УТРЕННЯЯ РАССЫЛКА ==========
 async def send_morning_pic(user_id: int):
     if not image_files:
         return
@@ -963,7 +985,6 @@ async def handle_poll_answer(callback: CallbackQuery, state: FSMContext):
             update_quick_test_time(user_id)
             await callback.message.answer("+10 очков за экспресс-тест! ⚡")
         elif data.get('first_poll', False):
-            # Это был пробный опрос, переходим к настройке времени
             await callback.message.answer(
                 "Спасибо за пробный опрос! Теперь давай настроим время для ежедневных опросов.",
                 reply_markup=main_menu_kb()
@@ -991,6 +1012,7 @@ async def handle_poll_answer(callback: CallbackQuery, state: FSMContext):
             reply_markup=build_poll_kb()
         )
     await callback.answer()
+
 # ========== ПЛАНИРОВЩИК ==========
 def setup_scheduler():
     scheduler.add_job(scheduled_polls, trigger="interval", minutes=1)
