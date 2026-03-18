@@ -4,39 +4,61 @@ import logging
 import random
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import ephem
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     KeyboardButton,
     InlineKeyboardMarkup,
-    InlineKeyboardButton,
     CallbackQuery,
-    FSInputFile
+    FSInputFile,
+    ReplyKeyboardMarkup
 )
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ========== КОНСТАНТЫ (можно менять прямо здесь) ==========
-ADMIN_ID = 7498442456              # ⚠️ замените на свой Telegram ID
-DB_NAME = "stress_bot.db"          # файл базы данных
-IMAGES_FOLDER = "images"           # папка с картинками
-POLL_QUESTIONS_COUNT = 4            # количество вопросов в опросе (должно совпадать с числом вопросов ниже)
+# ========== КОНСТАНТЫ ==========
+ADMIN_ID = 123456789              # ⚠️ ЗАМЕНИТЕ НА СВОЙ ID
+DB_NAME = "stress_bot.db"
+IMAGES_FOLDER = "images"
+MOON_PHOTOS_FOLDER = "moon_photos"
+FACTS_DAY_FILE = "facts_day.txt"
+POLL_QUESTIONS_COUNT = 8
 
 # ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
-    raise ValueError("❌ Переменная окружения BOT_TOKEN не установлена! Задайте её на хостинге.")
+    raise ValueError("❌ Переменная окружения BOT_TOKEN не установлена!")
+
+# ========== ЗАГРУЗКА ФАКТОВ ==========
+def load_facts(filename: str) -> List[str]:
+    facts = []
+    if os.path.exists(filename):
+        with open(filename, "r", encoding="utf-8") as f:
+            facts = [line.strip() for line in f if line.strip()]
+    else:
+        with open(filename, "w", encoding="utf-8") as f:
+            sample = [
+                "Интересный факт: Осьминоги имеют три сердца.",
+                "Факт: Бананы радиоактивны из-за содержания калия-40.",
+                "Знаете ли вы? Группа крови влияет на предрасположенность к стрессу."
+            ]
+            f.write("\n".join(sample))
+            facts = sample
+        logging.warning(f"Файл {filename} не найден, создан с примерами.")
+    return facts
+
+facts_day = load_facts(FACTS_DAY_FILE)
 
 # ========== ПРОВЕРКА НАЛИЧИЯ КАРТИНОК ==========
 if not os.path.exists(IMAGES_FOLDER):
     os.makedirs(IMAGES_FOLDER)
-    logging.warning(f"📁 Папка {IMAGES_FOLDER} создана. Положите в неё изображения для рассылки.")
+    logging.warning(f"📁 Папка {IMAGES_FOLDER} создана. Положите в неё изображения.")
 image_files = []
 for f in os.listdir(IMAGES_FOLDER):
     if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
@@ -53,23 +75,34 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
+            gender TEXT,                -- пол: 'male', 'female', 'other'
             registered DATE,
             points INTEGER DEFAULT 0,
             current_streak INTEGER DEFAULT 0,
             last_mood_date DATE,
-            morning_time TEXT,
-            evening_time TEXT
+            poll_time TEXT,
+            last_breathing DATE,
+            first_poll_done INTEGER DEFAULT 0,
+            consecutive_red_days INTEGER DEFAULT 0
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS moods (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            mood_score INTEGER,
+            raw_sum INTEGER,
+            zone TEXT,
             date DATE,
             time TIME,
-            moon_phase REAL,
             FOREIGN KEY(user_id) REFERENCES users(user_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS mood_details (
+            mood_id INTEGER,
+            q1 INTEGER, q2 INTEGER, q3 INTEGER, q4 INTEGER,
+            q5 INTEGER, q6 INTEGER, q7 INTEGER, q8 INTEGER,
+            FOREIGN KEY(mood_id) REFERENCES moods(id)
         )
     """)
     conn.commit()
@@ -86,22 +119,68 @@ def register_user(user_id: int, username: str, first_name: str):
     conn.commit()
     conn.close()
 
-def save_mood(user_id: int, score: int):
+def set_user_gender(user_id: int, gender: str):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET gender = ? WHERE user_id = ?", (gender, user_id))
+    conn.commit()
+    conn.close()
+
+def get_user_gender(user_id: int) -> Optional[str]:
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT gender FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def has_previous_moods(user_id: int) -> bool:
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM moods WHERE user_id = ?", (user_id,))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count > 0
+
+def set_first_poll_done(user_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET first_poll_done = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def save_mood_with_details(user_id: int, answers: List[int]):
     today = datetime.now().date().isoformat()
     now_time = datetime.now().time().strftime("%H:%M")
-    moon_phase = get_moon_phase(today)
+    raw_sum = sum(answers)
+
+    if raw_sum <= 16:
+        zone = 'green'
+    elif raw_sum <= 28:
+        zone = 'yellow'
+    else:
+        zone = 'red'
 
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO moods (user_id, mood_score, date, time, moon_phase) VALUES (?, ?, ?, ?, ?)",
-        (user_id, score, today, now_time, moon_phase)
-    )
-    # Обновляем статистику пользователя (очки, серии)
-    cur.execute("SELECT last_mood_date, current_streak FROM users WHERE user_id = ?", (user_id,))
+
+    cur.execute("""
+        INSERT INTO moods (user_id, raw_sum, zone, date, time)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, raw_sum, zone, today, now_time))
+    mood_id = cur.lastrowid
+
+    cur.execute("""
+        INSERT INTO mood_details (mood_id, q1, q2, q3, q4, q5, q6, q7, q8)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (mood_id, *answers))
+
+    cur.execute("SELECT last_mood_date, current_streak, consecutive_red_days FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
     last_date = row[0]
     streak = row[1] if row[1] else 0
+    consecutive_red = row[2] if row[2] else 0
+
     yesterday = (datetime.now().date() - timedelta(days=1)).isoformat()
     if last_date == yesterday:
         new_streak = streak + 1
@@ -110,18 +189,61 @@ def save_mood(user_id: int, score: int):
     else:
         new_streak = 1
 
-    points_add = 10
-    if new_streak > streak:
-        points_add += 5
+    if zone == 'red':
+        new_consecutive_red = consecutive_red + 1
+    else:
+        new_consecutive_red = 0
 
-    cur.execute(
-        "UPDATE users SET points = points + ?, current_streak = ?, last_mood_date = ? WHERE user_id = ?",
-        (points_add, new_streak, today, user_id)
-    )
+    cur.execute("""
+        UPDATE users SET
+            points = points + 15,
+            current_streak = ?,
+            last_mood_date = ?,
+            consecutive_red_days = ?
+        WHERE user_id = ?
+    """, (new_streak, today, new_consecutive_red, user_id))
+
     conn.commit()
     conn.close()
 
-def get_user_stats(user_id: int):
+    # Проверка триггеров (ответ 5 в вопросах 5 или 8)
+    if answers[4] == 5 or answers[7] == 5:
+        asyncio.create_task(notify_admin_trigger(user_id, answers))
+
+    # Проверка длительной красной зоны
+    if new_consecutive_red >= 3:
+        asyncio.create_task(notify_user_red_streak(user_id, new_consecutive_red))
+        asyncio.create_task(notify_admin_red_streak(user_id, new_consecutive_red))
+
+    return zone, raw_sum
+
+async def notify_admin_trigger(user_id: int, answers: List[int]):
+    try:
+        gender = get_user_gender(user_id) or "не указан"
+        text = (f"⚠️ Триггерный ответ у пользователя {user_id} (пол: {gender})\n"
+                f"Вопрос 5 (эмоции): {answers[4]}\n"
+                f"Вопрос 8 (контроль): {answers[7]}")
+        await bot.send_message(chat_id=ADMIN_ID, text=text)
+    except Exception as e:
+        logging.error(f"Не удалось отправить уведомление админу: {e}")
+
+async def notify_admin_red_streak(user_id: int, days: int):
+    try:
+        gender = get_user_gender(user_id) or "не указан"
+        text = f"🔴 Пользователь {user_id} (пол: {gender}) в красной зоне {days} дня подряд."
+        await bot.send_message(chat_id=ADMIN_ID, text=text)
+    except Exception as e:
+        logging.error(f"Не удалось отправить уведомление админу: {e}")
+
+async def notify_user_red_streak(user_id: int, days: int):
+    try:
+        text = ("Я замечаю, что тебе трудно уже несколько дней. "
+                "Возможно, стоит обсудить это со специалистом или близким человеком? 🫂")
+        await bot.send_message(chat_id=user_id, text=text)
+    except Exception as e:
+        logging.error(f"Не удалось отправить уведомление пользователю: {e}")
+
+def get_user_stats(user_id: int) -> Tuple[int, int, List[Tuple[int, str]]]:
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("SELECT points, current_streak FROM users WHERE user_id = ?", (user_id,))
@@ -129,10 +251,92 @@ def get_user_stats(user_id: int):
     points = user_row[0] if user_row else 0
     streak = user_row[1] if user_row else 0
 
-    cur.execute("SELECT mood_score FROM moods WHERE user_id = ? ORDER BY date DESC LIMIT 7", (user_id,))
-    recent = [row[0] for row in cur.fetchall()]
+    cur.execute("SELECT raw_sum, zone FROM moods WHERE user_id = ? ORDER BY date DESC LIMIT 7", (user_id,))
+    recent = [(row[0], row[1]) for row in cur.fetchall()]
     conn.close()
     return points, streak, recent
+
+def set_user_poll_time(user_id: int, poll_time: str):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET poll_time = ? WHERE user_id = ?", (poll_time, user_id))
+    conn.commit()
+    conn.close()
+
+def get_users_by_poll_time(current_time: str) -> List[int]:
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users WHERE poll_time = ?", (current_time,))
+    users = [row[0] for row in cur.fetchall()]
+    conn.close()
+    return users
+
+def get_all_users() -> List[int]:
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users")
+    users = [row[0] for row in cur.fetchall()]
+    conn.close()
+    return users
+
+def get_admin_stats():
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users")
+    total_users = cur.fetchone()[0]
+
+    week_ago = (datetime.now().date() - timedelta(days=7)).isoformat()
+    cur.execute("SELECT COUNT(DISTINCT user_id) FROM moods WHERE date >= ?", (week_ago,))
+    active_users = cur.fetchone()[0]
+
+    cur.execute("SELECT AVG(raw_sum) FROM moods WHERE date >= ?", (week_ago,))
+    avg_raw = cur.fetchone()[0] or 0
+
+    cur.execute("SELECT zone, COUNT(*) FROM moods WHERE date >= ? GROUP BY zone", (week_ago,))
+    zone_dist = cur.fetchall()
+
+    # Статистика по полу
+    cur.execute("SELECT gender, COUNT(*) FROM users GROUP BY gender")
+    gender_stats = cur.fetchall()
+
+    conn.close()
+    return total_users, active_users, avg_raw, zone_dist, gender_stats
+
+def has_today_mood(user_id: int) -> bool:
+    today = datetime.now().date().isoformat()
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM moods WHERE user_id = ? AND date = ?", (user_id, today))
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
+
+def add_points(user_id: int, points: int):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (points, user_id))
+    conn.commit()
+    conn.close()
+
+def can_take_breathing(user_id: int) -> bool:
+    today = datetime.now().date().isoformat()
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT last_breathing FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    if row and row[0] == today:
+        conn.close()
+        return False
+    conn.close()
+    return True
+
+def mark_breathing_done(user_id: int):
+    today = datetime.now().date().isoformat()
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET last_breathing = ? WHERE user_id = ?", (today, user_id))
+    conn.commit()
+    conn.close()
 
 def get_moon_phase(date_str: str) -> float:
     d = ephem.Date(date_str)
@@ -140,77 +344,67 @@ def get_moon_phase(date_str: str) -> float:
     moon.compute(d)
     return moon.moon_phase
 
-def set_user_notification_time(user_id: int, morning: Optional[str] = None, evening: Optional[str] = None):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    if morning is not None:
-        cur.execute("UPDATE users SET morning_time = ? WHERE user_id = ?", (morning, user_id))
-    if evening is not None:
-        cur.execute("UPDATE users SET evening_time = ? WHERE user_id = ?", (evening, user_id))
-    conn.commit()
-    conn.close()
-
-def get_users_for_notification(period: str, current_time: str):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    if period == "morning":
-        cur.execute("SELECT user_id FROM users WHERE morning_time = ?", (current_time,))
-    else:
-        cur.execute("SELECT user_id FROM users WHERE evening_time = ?", (current_time,))
-    users = [row[0] for row in cur.fetchall()]
-    conn.close()
-    return users
-
-# ========== ОПРЕДЕЛЕНИЕ ВОПРОСОВ ДЛЯ ОПРОСА ==========
+# ========== ВОПРОСЫ ОПРОСА ==========
 class PollQuestions:
     questions = [
         {
-            "text": "Как ты оцениваешь свою усталость сегодня?",
-            "options": [
-                ("😎 Бодрячком", 1),
-                ("😐 Нормально, но подустал(а)", 3),
-                ("😴 Очень устал(а), еле двигаюсь", 5),
-                ("💤 Полный ноль, хочу только спать", 5)
-            ]
+            "text": "Как чувствует себя твоё тело?",
+            "hint": "1 — полностью расслаблен, 5 — всё зажато и болит"
         },
         {
-            "text": "Насколько ты доволен(льна) сегодняшним днём?",
-            "options": [
-                ("😍 Отлично!", 1),
-                ("🙂 Неплохо", 2),
-                ("😐 Так себе", 3),
-                ("😞 Плохо", 4),
-                ("😫 Ужасно", 5)
-            ]
+            "text": "Насколько тебя сегодня 'грузят' уведомления и новости?",
+            "hint": "1 — вообще не замечаю, 5 — тотальный перегруз"
         },
         {
-            "text": "Были ли сегодня ситуации, которые вызвали стресс или тревогу?",
-            "options": [
-                ("✅ Нет, всё спокойно", 1),
-                ("⚠️ Были небольшие", 3),
-                ("🔥 Да, сильно напрягали", 5)
-            ]
+            "text": "Много ли в голове крутится мыслей 'а что если...'?",
+            "hint": "1 — в голове чисто, 5 — мысли не остановить"
         },
         {
-            "text": "Как ты оцениваешь качество своего сна прошлой ночью?",
-            "options": [
-                ("💤 Выспался(ась) отлично", 1),
-                ("😐 Средне", 3),
-                ("😫 Плохо, почти не спал(а)", 5)
-            ]
+            "text": "Как с концентрацией на делах?",
+            "hint": "1 — я в потоке, 5 — туман в голове, не могу собраться"
+        },
+        {
+            "text": "Твой общий вайб сегодня?",
+            "hint": "1 — спокойствие и радость, 5 — на грани срыва"
+        },
+        {
+            "text": "Как самочувствие после сна?",
+            "hint": "1 — бодр и свеж, 5 — состояние зомби"
+        },
+        {
+            "text": "Готов(а) к общению с людьми?",
+            "hint": "1 — заряжен на 100%, 5 — хочу исчезнуть"
+        },
+        {
+            "text": "Чувствуешь, что управляешь своей жизнью сегодня?",
+            "hint": "1 — полностью рулю, 5 — вокруг полный хаос"
         }
     ]
 
+# ========== ПРЕДОСТЕРЕЖЕНИЯ О ЛУНЕ ==========
+moon_disclaimers = [
+    "* Хотя некоторые люди замечают изменения в самочувствии в полнолуние, научные исследования не подтверждают прямого влияния луны на стресс.",
+    "* Связь фаз луны с эмоциональным состоянием — скорее фольклор, чем доказанный факт.",
+    "* Не принимайте фазу луны как руководство к действию — ваш стресс зависит от многих реальных факторов.",
+    "* Исследования показывают, что вера в влияние луны может создавать эффект самовнушения, но объективной связи нет."
+]
+
 # ========== СОСТОЯНИЯ FSM ==========
-class NotificationSetup(StatesGroup):
-    waiting_for_morning = State()
-    waiting_for_evening = State()
+class Registration(StatesGroup):
+    waiting_for_gender = State()
+
+class TimeSetup(StatesGroup):
+    waiting_for_poll = State()
 
 class EveningPoll(StatesGroup):
     q1 = State()
     q2 = State()
     q3 = State()
     q4 = State()
+    q5 = State()
+    q6 = State()
+    q7 = State()
+    q8 = State()
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = Bot(token=TOKEN)
@@ -218,100 +412,142 @@ dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler()
 
 # ========== КЛАВИАТУРЫ ==========
-def main_menu_kb():
+def gender_kb() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
-    builder.add(KeyboardButton(text="📝 Пройти вечерний опрос"))
+    builder.add(KeyboardButton(text="👨 Мужской"))
+    builder.add(KeyboardButton(text="👩 Женский"))
+    builder.add(KeyboardButton(text="⚪ Другое/Не скажу"))
+    builder.adjust(2, 1)
+    return builder.as_markup(resize_keyboard=True, one_time_keyboard=True)
+
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    builder = ReplyKeyboardBuilder()
     builder.add(KeyboardButton(text="📊 Моя статистика"))
+    builder.add(KeyboardButton(text="🧘 Дыхательная гимнастика"))
+    builder.add(KeyboardButton(text="⏰ Настроить время опроса"))
     builder.add(KeyboardButton(text="🌙 Фаза луны"))
-    builder.add(KeyboardButton(text="⚙️ Настройки рассылки"))
-    builder.adjust(2, 2)
+    builder.add(KeyboardButton(text="ℹ️ О боте"))
+    builder.adjust(2, 2, 1)
     return builder.as_markup(resize_keyboard=True)
 
-def build_poll_kb(options: List[tuple]) -> InlineKeyboardMarkup:
+def build_poll_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for text, value in options:
-        builder.button(text=text, callback_data=f"poll_{value}")
+    for i in range(1, 6):
+        builder.button(text=str(i), callback_data=f"poll_{i}")
+    builder.adjust(5)
     return builder.as_markup()
 
 # ========== ОБРАБОТЧИКИ ==========
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
     user = message.from_user
     register_user(user.id, user.username, user.first_name)
+    # Проверяем, не указан ли уже пол
+    if get_user_gender(user.id) is None:
+        await message.answer(
+            f"Привет, {user.first_name}! 🌟\n"
+            "Для более персонализированной работы укажи, пожалуйста, свой пол.\n"
+            "(Это поможет в анализе статистики, данные анонимны)",
+            reply_markup=gender_kb()
+        )
+        await state.set_state(Registration.waiting_for_gender)
+    else:
+        # Пол уже указан, переходим к настройке времени
+        await message.answer(
+            "Давай настроим время для вечернего опроса (например, 20:00).",
+            reply_markup=main_menu_kb()
+        )
+        await message.answer(
+            "Напиши время для **вечернего опроса** в формате ЧЧ:ММ (например, 20:00).\n"
+            "Если хочешь настроить позже, отправь «позже»."
+        )
+        await state.set_state(TimeSetup.waiting_for_poll)
+
+@dp.message(Registration.waiting_for_gender)
+async def process_gender(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    gender_map = {
+        "👨 Мужской": "male",
+        "👩 Женский": "female",
+        "⚪ Другое/Не скажу": "other"
+    }
+    if text not in gender_map:
+        await message.answer("Пожалуйста, выбери вариант из кнопок ниже.", reply_markup=gender_kb())
+        return
+    gender = gender_map[text]
+    set_user_gender(message.from_user.id, gender)
     await message.answer(
-        f"Привет, {user.first_name}! 🌟\n"
-        "Этот бот поможет тебе отслеживать уровень стресса с помощью вечернего опроса.\n"
-        "После ответов на несколько вопросов я рассчитаю твой уровень стресса и сохраню его.\n"
-        "Используй меню ниже:",
+        "Спасибо! Теперь настроим время для вечернего опроса.",
         reply_markup=main_menu_kb()
     )
-
-@dp.message(F.text == "📝 Пройти вечерний опрос")
-async def start_poll(message: types.Message, state: FSMContext):
-    today = datetime.now().date().isoformat()
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM moods WHERE user_id = ? AND date = ?", (message.from_user.id, today))
-    if cur.fetchone():
-        await message.answer("Ты уже проходил(а) опрос сегодня. Возвращайся завтра!")
-        conn.close()
-        return
-    conn.close()
-    await state.set_state(EveningPoll.q1)
-    q = PollQuestions.questions[0]
     await message.answer(
-        f"Вопрос 1/{POLL_QUESTIONS_COUNT}:\n{q['text']}",
-        reply_markup=build_poll_kb(q['options'])
+        "Напиши время для **вечернего опроса** в формате ЧЧ:ММ (например, 20:00).\n"
+        "Если хочешь настроить позже, отправь «позже»."
+    )
+    await state.set_state(TimeSetup.waiting_for_poll)
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "📌 **Команды бота:**\n"
+        "/start — регистрация и настройка времени\n"
+        "/help — это сообщение\n\n"
+        "**Кнопки меню:**\n"
+        "📊 Моя статистика — очки, серия, последние результаты\n"
+        "🧘 Дыхательная гимнастика — упражнение +5 очков (раз в день)\n"
+        "⏰ Настроить время опроса — изменить время вечернего опроса\n"
+        "🌙 Фаза луны — картинка и описание текущей фазы\n"
+        "ℹ️ О боте — информация о проекте"
     )
 
-@dp.callback_query(lambda c: c.data and c.data.startswith('poll_'))
-async def handle_poll_answer(callback: CallbackQuery, state: FSMContext):
-    score = int(callback.data.split('_')[1])
-    current_state = await state.get_state()
-    if current_state == EveningPoll.q1.state:
-        await state.update_data(q1=score)
-        await state.set_state(EveningPoll.q2)
-        q = PollQuestions.questions[1]
-        await callback.message.edit_text(
-            f"Вопрос 2/{POLL_QUESTIONS_COUNT}:\n{q['text']}",
-            reply_markup=build_poll_kb(q['options'])
-        )
-    elif current_state == EveningPoll.q2.state:
-        await state.update_data(q2=score)
-        await state.set_state(EveningPoll.q3)
-        q = PollQuestions.questions[2]
-        await callback.message.edit_text(
-            f"Вопрос 3/{POLL_QUESTIONS_COUNT}:\n{q['text']}",
-            reply_markup=build_poll_kb(q['options'])
-        )
-    elif current_state == EveningPoll.q3.state:
-        await state.update_data(q3=score)
-        await state.set_state(EveningPoll.q4)
-        q = PollQuestions.questions[3]
-        await callback.message.edit_text(
-            f"Вопрос 4/{POLL_QUESTIONS_COUNT}:\n{q['text']}",
-            reply_markup=build_poll_kb(q['options'])
-        )
-    elif current_state == EveningPoll.q4.state:
-        data = await state.get_data()
-        q1 = data.get('q1', 0)
-        q2 = data.get('q2', 0)
-        q3 = data.get('q3', 0)
-        q4 = score
-        total = q1 + q2 + q3 + q4
-        # Преобразование суммы в шкалу 1-10
-        stress_level = round((total - 4) * 9 / 16 + 1)
-        user_id = callback.from_user.id
-        save_mood(user_id, stress_level)
-        await callback.message.edit_text(
-            f"✅ Опрос завершён!\n"
-            f"Твой уровень стресса сегодня: **{stress_level} из 10**.\n"
-            f"Спасибо, что поделился(ась)! 😊"
-        )
-        phase = get_moon_phase(datetime.now().date().isoformat())
-        await callback.message.answer(f"🌙 Сегодня фаза луны: {phase:.2f}")
+@dp.message(Command("admin_stats"))
+async def admin_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    total, active, avg_raw, zone_dist, gender_stats = get_admin_stats()
+    avg_stress = round((avg_raw - 8) * 9 / 32 + 1, 1) if avg_raw else 0
+    text = (
+        f"📊 **Статистика бота**\n\n"
+        f"👥 Всего пользователей: {total}\n"
+        f"📆 Активных за 7 дней: {active}\n"
+        f"📉 Средний уровень стресса (7 дней): {avg_stress}/10 (сырой: {avg_raw:.1f})\n\n"
+        f"Распределение по зонам за 7 дней:\n"
+    )
+    zone_emoji = {'green': '🟢', 'yellow': '🟡', 'red': '🔴'}
+    for zone, count in zone_dist:
+        text += f"{zone_emoji.get(zone, '⚪')} {zone}: {count}\n"
+
+    text += "\n**Статистика по полу:**\n"
+    gender_names = {'male': '👨 Мужской', 'female': '👩 Женский', 'other': '⚪ Другое', None: '❓ Не указан'}
+    for gender, count in gender_stats:
+        text += f"{gender_names.get(gender, gender)}: {count}\n"
+
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(TimeSetup.waiting_for_poll)
+async def set_poll_time(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if text.lower() == "позже":
+        await message.answer("Хорошо, можешь настроить позже в меню «⏰ Настроить время опроса».", reply_markup=main_menu_kb())
         await state.clear()
-    await callback.answer()
+        return
+    try:
+        datetime.strptime(text, "%H:%M")
+    except ValueError:
+        await message.answer("Неправильный формат. Попробуй ещё раз (ЧЧ:ММ) или отправь «позже».")
+        return
+    user_id = message.from_user.id
+    set_user_poll_time(user_id, text)
+    await message.answer(f"Время вечернего опроса сохранено: {text}. Я пришлю вопросы в это время.", reply_markup=main_menu_kb())
+    await state.clear()
+
+@dp.message(F.text == "⏰ Настроить время опроса")
+async def time_settings(message: types.Message, state: FSMContext):
+    await message.answer(
+        "Напиши время для **вечернего опроса** в формате ЧЧ:ММ (например, 20:00).\n"
+        "Если не хочешь менять, отправь «нет»."
+    )
+    await state.set_state(TimeSetup.waiting_for_poll)
 
 @dp.message(F.text == "📊 Моя статистика")
 async def show_stats(message: types.Message):
@@ -319,100 +555,192 @@ async def show_stats(message: types.Message):
     points, streak, recent = get_user_stats(user_id)
     text = f"📈 **Твоя статистика**\n\n⭐ Очки: {points}\n🔥 Серия дней: {streak}\n\n"
     if recent:
-        text += "Последние оценки стресса (от новых к старым):\n"
-        text += " ".join(str(x) for x in recent)
+        text += "Последние результаты (от новых к старым):\n"
+        for raw, zone in recent:
+            emoji = {'green': '🟢', 'yellow': '🟡', 'red': '🔴'}.get(zone, '⚪')
+            text += f"{emoji} {raw} баллов\n"
     else:
-        text += "Пока нет оценок стресса. Пройди опрос!"
+        text += "Пока нет оценок стресса. Дождись вечернего опроса!"
     await message.answer(text, parse_mode="Markdown")
+
+@dp.message(F.text == "🧘 Дыхательная гимнастика")
+async def breathing_exercise(message: types.Message):
+    user_id = message.from_user.id
+    if can_take_breathing(user_id):
+        exercise = (
+            "🌀 **Квадратное дыхание**:\n"
+            "Вдох (4 сек) → Задержка (4 сек) → Выдох (4 сек) → Задержка (4 сек).\n"
+            "Повтори 5 раз."
+        )
+        await message.answer(exercise, parse_mode="Markdown")
+        add_points(user_id, 5)
+        mark_breathing_done(user_id)
+        await message.answer("+5 очков за заботу о себе! 💚")
+    else:
+        await message.answer("Ты уже выполнял(а) дыхательную гимнастику сегодня. Возвращайся завтра!")
 
 @dp.message(F.text == "🌙 Фаза луны")
 async def show_moon(message: types.Message):
     today = datetime.now().date().isoformat()
     phase = get_moon_phase(today)
+
     if phase < 0.05:
         desc = "🌑 Новолуние"
+        img_file = "new_moon.jpg"
     elif phase < 0.2:
         desc = "🌒 Молодая луна"
+        img_file = "waxing_crescent.jpg"
     elif phase < 0.3:
         desc = "🌓 Первая четверть"
+        img_file = "first_quarter.jpg"
     elif phase < 0.45:
         desc = "🌔 Растущая луна"
+        img_file = "waxing_gibbous.jpg"
     elif phase < 0.55:
         desc = "🌕 Полнолуние"
+        img_file = "full_moon.jpg"
     elif phase < 0.7:
         desc = "🌖 Убывающая луна"
+        img_file = "waning_gibbous.jpg"
     elif phase < 0.8:
         desc = "🌗 Последняя четверть"
+        img_file = "last_quarter.jpg"
     else:
         desc = "🌘 Старая луна"
-    await message.answer(f"Сегодня {desc}\n(фаза: {phase:.2f})")
+        img_file = "waning_crescent.jpg"
 
-@dp.message(F.text == "⚙️ Настройки рассылки")
-async def notification_settings(message: types.Message, state: FSMContext):
-    await message.answer(
-        "Я могу присылать тебе мотивационные картинки или мемы утром и вечером.\n"
-        "Напиши время для **утренней** рассылки в формате ЧЧ:ММ (например, 08:00).\n"
-        "Если не хочешь получать утром, отправь «нет»."
-    )
-    await state.set_state(NotificationSetup.waiting_for_morning)
-
-@dp.message(NotificationSetup.waiting_for_morning)
-async def set_morning_time(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if text.lower() == "нет":
-        morning = None
-    else:
-        try:
-            datetime.strptime(text, "%H:%M")
-            morning = text
-        except ValueError:
-            await message.answer("Неправильный формат. Попробуй ещё раз (ЧЧ:ММ) или отправь «нет».")
-            return
-    await state.update_data(morning=morning)
-    await message.answer("Теперь напиши время для **вечерней** рассылки (ЧЧ:ММ) или «нет».")
-    await state.set_state(NotificationSetup.waiting_for_evening)
-
-@dp.message(NotificationSetup.waiting_for_evening)
-async def set_evening_time(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if text.lower() == "нет":
-        evening = None
-    else:
-        try:
-            datetime.strptime(text, "%H:%M")
-            evening = text
-        except ValueError:
-            await message.answer("Неправильный формат. Попробуй ещё раз (ЧЧ:ММ) или отправь «нет».")
-            return
-    data = await state.get_data()
-    morning = data.get("morning")
-    user_id = message.from_user.id
-    set_user_notification_time(user_id, morning, evening)
-    await message.answer("Настройки сохранены! ✅", reply_markup=main_menu_kb())
-    await state.clear()
-
-# ========== РАССЫЛКА ПО РАСПИСАНИЮ ==========
-async def send_motivation(user_id: int, period: str):
-    if not image_files:
-        return
-    try:
-        img_path = random.choice(image_files)
+    img_path = os.path.join(MOON_PHOTOS_FOLDER, img_file)
+    if os.path.exists(img_path):
         photo = FSInputFile(img_path)
-        caption = "Доброе утро!" if period == "morning" else "Добрый вечер! Как прошёл день?"
-        await bot.send_photo(chat_id=user_id, photo=photo, caption=caption)
-    except Exception as e:
-        logging.error(f"Не удалось отправить картинку пользователю {user_id}: {e}")
+        await message.answer_photo(
+            photo=photo,
+            caption=f"Сегодня {desc}\n(фаза: {phase:.2f})"
+        )
+    else:
+        await message.answer(f"Сегодня {desc}\n(фаза: {phase:.2f})")
 
-async def check_notifications():
+    if random.random() < 0.3:
+        disclaimer = random.choice(moon_disclaimers)
+        await message.answer(disclaimer)
+
+@dp.message(F.text == "ℹ️ О боте")
+async def about(message: types.Message):
+    await message.answer(
+        "Этот бот помогает отслеживать уровень стресса и заботиться о себе.\n"
+        "Каждый вечер в настроенное время я присылаю опрос из 8 вопросов.\n"
+        "За прохождение опроса ты получаешь очки и серии дней.\n"
+        "Дыхательная гимнастика приносит дополнительные очки.\n\n"
+        "🌙 *О луне:* информация о фазах луны добавляется для интереса, "
+        "но не имеет доказанного влияния на стресс.\n\n"
+        "📌 **О проекте:**\n"
+        "Данный бот разработан в рамках республиканской научно-практической "
+        "конференции школьников «Первые шаги в науку» (2026 год).\n"
+        "Автор: [Ваше ФИО], 11 класс, [школа]"
+    )
+
+# ========== ВЕЧЕРНИЙ ОПРОС ПО РАСПИСАНИЮ ==========
+async def send_poll_to_user(user_id: int):
+    if has_today_mood(user_id):
+        return
+    current_state = await dp.fsm.storage.get_state(chat=user_id)
+    if current_state and current_state.startswith('EveningPoll'):
+        return
+    await dp.fsm.storage.set_state(chat=user_id, state=EveningPoll.q1)
+    await dp.fsm.storage.set_data(chat=user_id, data={'answers': [], 'first_poll': not has_previous_moods(user_id)})
+    q = PollQuestions.questions[0]
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=f"🌆 Вечерний опрос (1/{POLL_QUESTIONS_COUNT}):\n{q['text']}\n_{q['hint']}_",
+            parse_mode="Markdown",
+            reply_markup=build_poll_kb()
+        )
+    except Exception as e:
+        logging.error(f"Не удалось отправить опрос пользователю {user_id}: {e}")
+
+async def scheduled_polls():
     now = datetime.now().strftime("%H:%M")
-    for uid in get_users_for_notification("morning", now):
-        await send_motivation(uid, "morning")
-    for uid in get_users_for_notification("evening", now):
-        await send_motivation(uid, "evening")
+    users = get_users_by_poll_time(now)
+    for uid in users:
+        await send_poll_to_user(uid)
+
+# ========== ОБРАБОТКА ОТВЕТОВ НА ОПРОС ==========
+@dp.callback_query(lambda c: c.data and c.data.startswith('poll_'))
+async def handle_poll_answer(callback: CallbackQuery, state: FSMContext):
+    score = int(callback.data.split('_')[1])
+    current_state = await state.get_state()
+    if not current_state or not current_state.startswith('EveningPoll'):
+        await callback.answer("Сейчас нет активного опроса.", show_alert=True)
+        return
+    state_num = int(current_state.split(':')[1].replace('q', ''))
+
+    data = await state.get_data()
+    answers = data.get('answers', [])
+    answers.append(score)
+    await state.update_data(answers=answers)
+
+    if state_num == POLL_QUESTIONS_COUNT:
+        user_id = callback.from_user.id
+        zone, raw_sum = save_mood_with_details(user_id, answers)
+
+        if zone == 'green':
+            feedback = "Красавчик/Красотка! Ты в балансе. Поддерживай этот вайб ✨"
+        elif zone == 'yellow':
+            feedback = ("Похоже, день выдался напряженным. Давай выдохнем? "
+                        "Сделай 5 глубоких вдохов или просто отложи телефон на 15 минут 🧘‍♂️")
+        else:
+            feedback = ("Ого, уровень стресса зашкаливает. Пожалуйста, береги себя. "
+                        "Попробуй технику заземления (назови 5 предметов, которые видишь прямо сейчас) или напиши другу 🫂")
+
+        await callback.message.edit_text(
+            f"✅ Опрос завершён!\n"
+            f"Сумма баллов: {raw_sum}\n"
+            f"Зона: {'🟢 Зелёная' if zone=='green' else '🟡 Жёлтая' if zone=='yellow' else '🔴 Красная'}\n\n"
+            f"{feedback}"
+        )
+
+        if data.get('first_poll', False):
+            await callback.message.answer(
+                "Спасибо, что прошёл первый опрос! Теперь я буду присылать его ежедневно в выбранное время."
+            )
+            set_first_poll_done(user_id)
+
+        await callback.message.answer(
+            "Выбери действие:",
+            reply_markup=main_menu_kb()
+        )
+        await state.clear()
+    else:
+        next_num = state_num + 1
+        next_state = getattr(EveningPoll, f'q{next_num}')
+        await state.set_state(next_state)
+        q = PollQuestions.questions[next_num-1]
+        await callback.message.edit_text(
+            f"Вопрос {next_num}/{POLL_QUESTIONS_COUNT}:\n{q['text']}\n_{q['hint']}_",
+            parse_mode="Markdown",
+            reply_markup=build_poll_kb()
+        )
+    await callback.answer()
+
+# ========== ДНЕВНАЯ РАССЫЛКА ФАКТОВ ==========
+async def send_day_fact(user_id: int):
+    if facts_day:
+        fact = random.choice(facts_day)
+        try:
+            await bot.send_message(chat_id=user_id, text=f"📌 Интересный факт:\n{fact}")
+        except Exception as e:
+            logging.error(f"Не удалось отправить факт {user_id}: {e}")
+
+async def scheduled_day_facts():
+    now = datetime.now()
+    if 12 <= now.hour < 14:
+        for uid in get_all_users():
+            await send_day_fact(uid)
 
 # ========== ПЛАНИРОВЩИК ==========
 def setup_scheduler():
-    scheduler.add_job(check_notifications, trigger="interval", minutes=1)
+    scheduler.add_job(scheduled_polls, trigger="interval", minutes=1)
+    scheduler.add_job(scheduled_day_facts, trigger="interval", minutes=30)
     scheduler.start()
 
 # ========== ЗАПУСК ==========
