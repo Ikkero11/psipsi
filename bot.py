@@ -340,6 +340,7 @@ def set_user_poll_time(user_id: int, poll_time: str):
     cur.execute("UPDATE users SET poll_time = ? WHERE user_id = ?", (poll_time, user_id))
     conn.commit()
     conn.close()
+    logging.info(f"Сохранено время опроса для {user_id}: {poll_time}")
 
 def set_user_morning_time(user_id: int, morning_time: Optional[str]):
     conn = sqlite3.connect(DB_NAME)
@@ -353,8 +354,17 @@ def get_users_by_poll_time(current_time: str) -> List[int]:
     conn = sqlite3.connect(DB_NAME)
     conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
+    # Логируем всех пользователей с установленным временем
+    cur.execute("SELECT user_id, poll_time FROM users WHERE poll_time IS NOT NULL")
+    all_with_time = cur.fetchall()
+    if all_with_time:
+        logging.info(f"Все пользователи с poll_time: {all_with_time}")
+    else:
+        logging.info("Нет пользователей с установленным poll_time")
+    # Ищем совпадение
     cur.execute("SELECT user_id FROM users WHERE poll_time = ?", (current_time,))
     users = [row[0] for row in cur.fetchall()]
+    logging.info(f"Текущее время: {current_time}, найдено пользователей: {users}")
     conn.close()
     return users
 
@@ -362,8 +372,17 @@ def get_users_by_morning_time(current_time: str) -> List[int]:
     conn = sqlite3.connect(DB_NAME)
     conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users WHERE morning_time = ?", (current_time,))
+    # Логируем всех пользователей с установленным временем
+    cur.execute("SELECT user_id, poll_time FROM users WHERE poll_time IS NOT NULL")
+    all_with_time = cur.fetchall()
+    if all_with_time:
+        logging.info(f"Все пользователи с poll_time: {all_with_time}")
+    else:
+        logging.info("Нет пользователей с установленным poll_time")
+    # Ищем совпадение
+    cur.execute("SELECT user_id FROM users WHERE poll_time = ?", (current_time,))
     users = [row[0] for row in cur.fetchall()]
+    logging.info(f"Текущее время: {current_time}, найдено пользователей: {users}")
     conn.close()
     return users
 
