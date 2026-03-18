@@ -923,10 +923,12 @@ async def handle_poll_answer(callback: CallbackQuery, state: FSMContext):
         questions = PollQuestions.questions
         total = POLL_QUESTIONS_COUNT
         state_num = int(current_state.split(':')[1].replace('q', ''))
+        state_class = EveningPoll
     elif current_state.startswith('QuickTest'):
         questions = PollQuestions.questions[:QUICK_TEST_QUESTIONS]
         total = QUICK_TEST_QUESTIONS
         state_num = int(current_state.split(':')[1].replace('q', ''))
+        state_class = QuickTest
     else:
         await callback.answer("Неизвестное состояние.", show_alert=True)
         return
@@ -980,7 +982,7 @@ async def handle_poll_answer(callback: CallbackQuery, state: FSMContext):
         await state.clear()
     else:
         next_num = state_num + 1
-        next_state = getattr(state.__class__, f'q{next_num}')
+        next_state = getattr(state_class, f'q{next_num}')
         await state.set_state(next_state)
         q = questions[next_num-1]
         await callback.message.edit_text(
@@ -989,7 +991,6 @@ async def handle_poll_answer(callback: CallbackQuery, state: FSMContext):
             reply_markup=build_poll_kb()
         )
     await callback.answer()
-
 # ========== ПЛАНИРОВЩИК ==========
 def setup_scheduler():
     scheduler.add_job(scheduled_polls, trigger="interval", minutes=1)
