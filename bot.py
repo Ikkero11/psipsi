@@ -52,8 +52,8 @@ if not image_files:
 # ========== БАЗА ДАННЫХ ==========
 def init_db():
     conn = sqlite3.connect(DB_NAME)
-    conn.execute("PRAGMA journal_mode=WAL")  # Включаем WAL-режим для конкурентного доступа
-    conn.execute("PRAGMA busy_timeout=5000")  # Ждать до 5 секунд при блокировке
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -164,18 +164,6 @@ def init_daily_tasks(user_id: int):
     conn.commit()
     conn.close()
 
-def update_task(user_id: int, task: str):
-    today = datetime.now(MOSCOW_TZ).date().isoformat()
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("PRAGMA busy_timeout=5000")
-    cur = conn.cursor()
-    cur.execute(f"UPDATE daily_tasks SET {task} = 1 WHERE user_id = ? AND task_date = ?", (user_id, today))
-    if cur.rowcount == 0:
-        cur.execute("INSERT INTO daily_tasks (user_id, task_date) VALUES (?, ?)", (user_id, today))
-        cur.execute(f"UPDATE daily_tasks SET {task} = 1 WHERE user_id = ? AND task_date = ?", (user_id, today))
-    conn.commit()
-    conn.close()
-
 def get_tasks_status(user_id: int) -> dict:
     today = datetime.now(MOSCOW_TZ).date().isoformat()
     conn = sqlite3.connect(DB_NAME)
@@ -225,59 +213,77 @@ def save_mood_with_details(user_id: int, answers: List[int], is_extra: bool = Fa
     conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
 
-    cur.execute("""
-        INSERT INTO moods (user_id, raw_sum, zone, date, time, is_extra)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (user_id, raw_sum, zone, today, now_time, 1 if is_extra else 0))
-    mood_id = cur.lastrowid
-
-    full_answers = answers + [0] * (8 - len(answers)) if len(answers) < 8 else answers[:8]
-    cur.execute("""
-        INSERT INTO mood_details (mood_id, q1, q2, q3, q4, q5, q6, q7, q8)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (mood_id, *full_answers))
-
-    if not is_extra:
-        cur.execute("SELECT last_mood_date, current_streak, consecutive_red_days FROM users WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-        last_date = row[0]
-        streak = row[1] if row[1] else 0
-        consecutive_red = row[2] if row[2] else 0
-
-        yesterday = (datetime.now(MOSCOW_TZ).date() - timedelta(days=1)).isoformat()
-        if last_date == yesterday:
-            new_streak = streak + 1
-        elif last_date == today:
-            new_streak = streak
-        else:
-            new_streak = 1
-
-        if zone == 'red':
-            new_consecutive_red = consecutive_red + 1
-        else:
-            new_consecutive_red = 0
-
+    try:
         cur.execute("""
-            UPDATE users SET
-                points = points + 15,
-                current_streak = ?,
-                last_mood_date = ?,
-                consecutive_red_days = ?
-            WHERE user_id = ?
-        """, (new_streak, today, new_consecutive_red, user_id))
+            INSERT INTO moods (user_id, raw_sum, zone, date, time, is_extra)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (user_id, raw_sum, zone, today, now_time, 1 if is_extra else 0))
+        mood_id = cur.lastrowid
 
-        update_task(user_id, 'poll_done')
-    else:
-        cur.execute("UPDATE users SET points = points + 10 WHERE user_id = ?", (user_id,))
-        update_task(user_id, 'quick_test_done')
+        full_answers = answers + [0] * (8 - len(answers)) if len(answers) < 8 else answers[:8]
+        cur.execute("""
+            INSERT INTO mood_details (mood_id, q1, q2, q3, q4, q5, q6, q7, q8)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (mood_id, *full_answers))
 
-    conn.commit()
-    conn.close()
+        # Обновляем ежедневные задания в том же соединении
+        if not is_extra:
+            cur.execute("""
+                INSERT INTO daily_tasks (user_id, task_date, poll_done)
+                VALUES (?, ?, 1)
+                ON CONFLICT(user_id, task_date) DO UPDATE SET poll_done = 1
+            """, (user_id, today))
+        else:
+            cur.execute("""
+                INSERT INTO daily_tasks (user_id, task_date, quick_test_done)
+                VALUES (?, ?, 1)
+                ON CONFLICT(user_id, task_date) DO UPDATE SET quick_test_done = 1
+            """, (user_id, today))
+
+        # Обновляем информацию о пользователе
+        if not is_extra:
+            cur.execute("SELECT last_mood_date, current_streak, consecutive_red_days FROM users WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            last_date = row[0]
+            streak = row[1] if row[1] else 0
+            consecutive_red = row[2] if row[2] else 0
+
+            yesterday = (datetime.now(MOSCOW_TZ).date() - timedelta(days=1)).isoformat()
+            if last_date == yesterday:
+                new_streak = streak + 1
+            elif last_date == today:
+                new_streak = streak
+            else:
+                new_streak = 1
+
+            if zone == 'red':
+                new_consecutive_red = consecutive_red + 1
+            else:
+                new_consecutive_red = 0
+
+            cur.execute("""
+                UPDATE users SET
+                    points = points + 15,
+                    current_streak = ?,
+                    last_mood_date = ?,
+                    consecutive_red_days = ?
+                WHERE user_id = ?
+            """, (new_streak, today, new_consecutive_red, user_id))
+        else:
+            cur.execute("UPDATE users SET points = points + 10 WHERE user_id = ?", (user_id,))
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Ошибка при сохранении настроения: {e}")
+        raise
+    finally:
+        conn.close()
 
     if not is_extra and (answers[4] == 5 or answers[7] == 5):
         asyncio.create_task(notify_admin_trigger(user_id, answers))
 
-    if not is_extra and new_consecutive_red >= 3:
+    if not is_extra and zone == 'red' and new_consecutive_red >= 3:
         asyncio.create_task(notify_user_red_streak(user_id, new_consecutive_red))
         asyncio.create_task(notify_admin_red_streak(user_id, new_consecutive_red))
 
@@ -437,9 +443,14 @@ def mark_breathing_done(user_id: int):
     cur = conn.cursor()
     cur.execute("UPDATE users SET last_breathing = ? WHERE user_id = ?", (today, user_id))
     cur.execute("UPDATE users SET points = points + 5 WHERE user_id = ?", (user_id,))
+    # Обновляем daily_tasks
+    cur.execute("""
+        INSERT INTO daily_tasks (user_id, task_date, breathing_done)
+        VALUES (?, ?, 1)
+        ON CONFLICT(user_id, task_date) DO UPDATE SET breathing_done = 1
+    """, (user_id, today))
     conn.commit()
     conn.close()
-    update_task(user_id, 'breathing_done')
 
 def can_take_quick_test(user_id: int) -> bool:
     conn = sqlite3.connect(DB_NAME)
