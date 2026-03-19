@@ -24,7 +24,7 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ========== КОНСТАНТЫ ==========
-ADMIN_ID = 123456789              # ⚠️ ЗАМЕНИТЕ НА СВОЙ ID
+ADMIN_ID = 7498442456              # ⚠️ ЗАМЕНИТЕ НА СВОЙ ID
 DB_NAME = "stress_bot.db"
 IMAGES_FOLDER = "images"
 MOON_PHOTOS_FOLDER = "moon_photos"
