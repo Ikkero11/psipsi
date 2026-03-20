@@ -3,6 +3,8 @@ import asyncio
 import logging
 import random
 import sqlite3
+import csv
+import io
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 
@@ -18,7 +20,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     CallbackQuery,
     FSInputFile,
-    ReplyKeyboardMarkup
+    ReplyKeyboardMarkup,
+    BufferedInputFile
 )
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -92,7 +95,9 @@ def init_db():
             last_breathing_ts TEXT,
             first_poll_done INTEGER DEFAULT 0,
             consecutive_red_days INTEGER DEFAULT 0,
-            last_quick_test TIMESTAMP
+            last_quick_test TIMESTAMP,
+            last_practice9_date DATE,
+            practice9_task TEXT
         )
     """)
     cur.execute("""
@@ -125,6 +130,33 @@ def init_db():
             PRIMARY KEY (user_id, task_date)
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS practices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            description TEXT,
+            points INTEGER,
+            active INTEGER DEFAULT 1
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS practice_completions (
+            user_id INTEGER,
+            practice_id INTEGER,
+            completion_date DATE,
+            count INTEGER DEFAULT 1,
+            PRIMARY KEY (user_id, practice_id, completion_date)
+        )
+    """)
+    # Добавим стандартные практики, если их нет
+    cur.execute("SELECT COUNT(*) FROM practices")
+    if cur.fetchone()[0] == 0:
+        practices_data = [
+            (1, "Тактильный детокс", "Попробуй заняться рукоделием: вязание, вышивка, макраме. Сделай фото процесса и отправь сюда.", 15),
+            (5, "Игра в алфавит", "Назови 3 предмета на выбранную букву. Это поможет заземлиться.", 15),
+            (9, "Разреши себе не быть идеальным", "Выполни сегодняшнее задание: оставь опечатку в сообщении или отправь сообщение без смайликов.", 10)
+        ]
+        cur.executemany("INSERT INTO practices (id, name, description, points) VALUES (?, ?, ?, ?)", practices_data)
     conn.commit()
     conn.close()
     logging.info("✅ База данных инициализирована (WAL mode).")
@@ -171,6 +203,14 @@ def add_points(user_id: int, points: int):
     conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
     cur.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (points, user_id))
+    conn.commit()
+    conn.close()
+
+def set_points(user_id: int, points: int):
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET points = ? WHERE user_id = ?", (points, user_id))
     conn.commit()
     conn.close()
 
@@ -335,7 +375,7 @@ async def notify_user_red_streak(user_id: int, days: int):
     except Exception as e:
         logging.error(f"Не удалось отправить уведомление пользователю: {e}")
 
-def get_user_stats(user_id: int) -> Tuple[int, int, List[Tuple[int, str]], List[Tuple[int, str]]]:
+def get_user_stats(user_id: int) -> Tuple[int, int, List[Tuple[int, str]], List[Tuple[int, str]], dict]:
     conn = sqlite3.connect(DB_NAME)
     conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
@@ -350,8 +390,15 @@ def get_user_stats(user_id: int) -> Tuple[int, int, List[Tuple[int, str]], List[
     cur.execute("SELECT raw_sum, zone FROM moods WHERE user_id = ? AND is_extra = 1 ORDER BY date DESC LIMIT 7", (user_id,))
     recent_extra = [(row[0], row[1]) for row in cur.fetchall()]
 
+    # Получаем статистику по практикам
+    cur.execute("""
+        SELECT practice_id, COUNT(*) FROM practice_completions 
+        WHERE user_id = ? GROUP BY practice_id
+    """, (user_id,))
+    practice_stats = {row[0]: row[1] for row in cur.fetchall()}
+
     conn.close()
-    return points, streak, recent_main, recent_extra
+    return points, streak, recent_main, recent_extra, practice_stats
 
 def set_user_poll_time(user_id: int, poll_time: str):
     conn = sqlite3.connect(DB_NAME)
@@ -499,6 +546,86 @@ def get_moon_phase(date_str: str) -> float:
     moon.compute(d)
     return moon.moon_phase
 
+# ========== ФУНКЦИИ ЭКСПОРТА ==========
+def export_stats_csv(days=30):
+    """Возвращает строку CSV с данными за последние `days` дней."""
+    end_date = datetime.now(MOSCOW_TZ).date()
+    start_date = end_date - timedelta(days=days)
+
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT u.user_id, u.username, u.first_name, m.date, m.raw_sum, m.zone, m.is_extra, u.points
+        FROM moods m
+        JOIN users u ON m.user_id = u.user_id
+        WHERE m.date >= ? AND m.date <= ?
+        ORDER BY m.date DESC, m.user_id
+    """, (start_date.isoformat(), end_date.isoformat()))
+    rows = cur.fetchall()
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['user_id', 'username', 'first_name', 'date', 'raw_sum', 'zone', 'is_extra', 'current_points'])
+    writer.writerows(rows)
+    return output.getvalue()
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПРАКТИК ==========
+def get_practice_info(practice_id: int) -> Optional[Tuple[str, str, int]]:
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT name, description, points FROM practices WHERE id = ?", (practice_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row if row else None
+
+def can_complete_practice(user_id: int, practice_id: int) -> bool:
+    today = datetime.now(MOSCOW_TZ).date().isoformat()
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM practice_completions WHERE user_id = ? AND practice_id = ? AND completion_date = ?",
+        (user_id, practice_id, today)
+    )
+    exists = cur.fetchone() is not None
+    conn.close()
+    return not exists
+
+def mark_practice_completed(user_id: int, practice_id: int, points: int):
+    today = datetime.now(MOSCOW_TZ).date().isoformat()
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO practice_completions (user_id, practice_id, completion_date) VALUES (?, ?, ?)",
+        (user_id, practice_id, today)
+    )
+    add_points(user_id, points)  # тихо начисляем очки
+    conn.commit()
+    conn.close()
+
+def get_practice9_task(user_id: int) -> str:
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT practice9_task, last_practice9_date FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    today = datetime.now(MOSCOW_TZ).date().isoformat()
+    if row and row[1] == today:
+        conn.close()
+        return None
+    tasks = [
+        "Отправь сообщение с одной опечаткой.",
+        "Отправь сообщение без смайликов.",
+        "Сделай пост в соцсети без фильтров.",
+        "Признайся кому-то в своей неидеальности.",
+        "Сделай фото без обработки."
+    ]
+    task = random.choice(tasks)
+    cur.execute("UPDATE users SET practice9_task = ?, last_practice9_date = ? WHERE user_id = ?", (task, today, user_id))
+    conn.commit()
+    conn.close()
+    return task
+
 # ========== ВОПРОСЫ ОПРОСА ==========
 class PollQuestions:
     questions = [
@@ -596,6 +723,13 @@ class QuickTest(StatesGroup):
 class BreathingChoice(StatesGroup):
     waiting_for_choice = State()
 
+class PracticeStates(StatesGroup):
+    practice1_waiting_photo = State()
+    practice5_choose_letter = State()
+    practice5_enter_letter = State()
+    practice5_waiting_words = State()
+    practice9_confirm = State()
+
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -616,10 +750,11 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     builder.add(KeyboardButton(text="🧘 Дыхательная гимнастика"))
     builder.add(KeyboardButton(text="⚡ Экспресс-тест"))
     builder.add(KeyboardButton(text="📋 Мои задания"))
+    builder.add(KeyboardButton(text="🧠 Практики"))
     builder.add(KeyboardButton(text="⏰ Настроить время"))
     builder.add(KeyboardButton(text="🌙 Фаза луны"))
     builder.add(KeyboardButton(text="ℹ️ О боте"))
-    builder.adjust(2, 2, 2, 1)
+    builder.adjust(2, 2, 2, 2)
     return builder.as_markup(resize_keyboard=True)
 
 def build_poll_kb() -> InlineKeyboardMarkup:
@@ -633,6 +768,18 @@ def build_breathing_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for idx, ex in enumerate(breathing_exercises):
         builder.button(text=ex['name'], callback_data=f"breath_{idx}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def build_practices_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM practices WHERE active=1")
+    practices = cur.fetchall()
+    conn.close()
+    for pid, name in practices:
+        builder.button(text=name, callback_data=f"practice_{pid}")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -719,9 +866,11 @@ async def cmd_help(message: types.Message):
         "🧘 Дыхательная гимнастика — выбор упражнения +5 очков (можно раз в 30 минут)\n"
         "⚡ Экспресс-тест — быстрый тест (не чаще раза в час) +10 очков\n"
         "📋 Мои задания — прогресс по ежедневным заданиям\n"
+        "🧠 Практики — специальные упражнения для снижения стресса\n"
         "⏰ Настроить время — изменить время опроса и утренней рассылки\n"
         "🌙 Фаза луны — картинка и описание текущей фазы\n"
-        "ℹ️ О боте — информация о проекте"
+        "ℹ️ О боте — информация о проекте\n\n"
+    
     )
 
 @dp.message(Command("admin_stats"))
@@ -756,6 +905,67 @@ async def admin_stats(message: types.Message):
         text += f"{gender_names.get(gender, gender)}: {count}\n"
 
     await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("admin_users"))
+async def admin_users(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA busy_timeout=5000")
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, username, poll_time, morning_time, points FROM users")
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        await message.answer("Нет пользователей.")
+        return
+    text = "*Список пользователей:*\n"
+    for row in rows:
+        text += f"ID: {row[0]}, @{row[1]}, опрос: {row[2] or 'не задано'}, утро: {row[3] or 'не задано'}, очки: {row[4]}\n"
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("export_stats"))
+async def export_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    csv_data = export_stats_csv(30)
+    if not csv_data.strip():
+        await message.answer("Нет данных за последние 30 дней.")
+        return
+    file = BufferedInputFile(csv_data.encode('utf-8'), filename="stress_stats.csv")
+    await message.answer_document(file, caption="Статистика за последние 30 дней")
+
+@dp.message(Command("add_points"))
+async def add_points_cmd(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.answer("Использование: /add_points <user_id> <количество>")
+        return
+    try:
+        user_id = int(parts[1])
+        points = int(parts[2])
+        add_points(user_id, points)
+        await message.answer(f"✅ Начислено {points} очков пользователю {user_id}")
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+
+@dp.message(Command("set_points"))
+async def set_points_cmd(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.answer("Использование: /set_points <user_id> <количество>")
+        return
+    try:
+        user_id = int(parts[1])
+        points = int(parts[2])
+        set_points(user_id, points)
+        await message.answer(f"✅ Установлено {points} очков пользователю {user_id}")
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
 
 @dp.message(TimeSetup.waiting_for_poll)
 async def set_poll_time(message: types.Message, state: FSMContext):
@@ -810,7 +1020,7 @@ async def time_settings(message: types.Message, state: FSMContext):
 @dp.message(F.text == "📊 Моя статистика")
 async def show_stats(message: types.Message):
     user_id = message.from_user.id
-    points, streak, recent_main, recent_extra = get_user_stats(user_id)
+    points, streak, recent_main, recent_extra, practice_stats = get_user_stats(user_id)
     text = f"📈 *Твоя статистика*\n\n⭐ Очки: {points}\n🔥 Серия дней: {streak}\n\n"
     if recent_main:
         text += "*Основные опросы* (последние 7):\n"
@@ -824,6 +1034,15 @@ async def show_stats(message: types.Message):
         for raw, zone in recent_extra:
             emoji = {'green': '🟢', 'yellow': '🟡', 'red': '🔴'}.get(zone, '⚪')
             text += f"{emoji} {raw} баллов\n"
+    if practice_stats:
+        text += "\n*Практики:*\n"
+        for pid, cnt in practice_stats.items():
+            if pid == 1:
+                text += f"🎨 Тактильный детокс: {cnt} раз\n"
+            elif pid == 5:
+                text += f"🔤 Алфавит: {cnt} раз\n"
+            elif pid == 9:
+                text += f"💭 Неидеальность: {cnt} раз\n"
     await message.answer(text, parse_mode="Markdown")
 
 @dp.message(F.text == "🧘 Дыхательная гимнастика")
@@ -891,140 +1110,141 @@ async def show_tasks(message: types.Message):
     )
     await message.answer(text, parse_mode="Markdown")
 
-@dp.message(F.text == "🌙 Фаза луны")
-async def show_moon(message: types.Message):
-    today = datetime.now(MOSCOW_TZ).date().isoformat()
-    phase = get_moon_phase(today)
-
-    if phase < 0.05:
-        desc = "🌑 Новолуние"
-        img_file = "new_moon.jpg"
-    elif phase < 0.2:
-        desc = "🌒 Молодая луна"
-        img_file = "waxing_crescent.jpg"
-    elif phase < 0.3:
-        desc = "🌓 Первая четверть"
-        img_file = "first_quarter.jpg"
-    elif phase < 0.45:
-        desc = "🌔 Растущая луна"
-        img_file = "waxing_gibbous.jpg"
-    elif phase < 0.55:
-        desc = "🌕 Полнолуние"
-        img_file = "full_moon.jpg"
-    elif phase < 0.7:
-        desc = "🌖 Убывающая луна"
-        img_file = "waning_gibbous.jpg"
-    elif phase < 0.8:
-        desc = "🌗 Последняя четверть"
-        img_file = "last_quarter.jpg"
-    else:
-        desc = "🌘 Старая луна"
-        img_file = "waning_crescent.jpg"
-
-    img_path = os.path.join(MOON_PHOTOS_FOLDER, img_file)
-    if os.path.exists(img_path):
-        photo = FSInputFile(img_path)
-        await message.answer_photo(
-            photo=photo,
-            caption=f"Сегодня {desc}\n(фаза: {phase:.2f})"
-        )
-    else:
-        await message.answer(f"Сегодня {desc}\n(фаза: {phase:.2f})")
-
-    if random.random() < 0.3:
-        disclaimer = random.choice(moon_disclaimers)
-        await message.answer(disclaimer)
-
-@dp.message(F.text == "ℹ️ О боте")
-async def about(message: types.Message):
+@dp.message(F.text == "🧠 Практики")
+async def practices_menu(message: types.Message, state: FSMContext):
     await message.answer(
-        "Этот бот помогает отслеживать уровень стресса и заботиться о себе.\n"
-        "Каждый вечер в настроенное время я присылаю опрос из 8 вопросов.\n"
-        "За прохождение опроса ты получаешь очки и серии дней.\n"
-        "Дыхательная гимнастика (можно выполнять каждые 30 минут) и экспресс-тесты приносят дополнительные очки.\n\n"
-        "🌙 *О луне:* информация о фазах луны добавляется для интереса, "
-        "но не имеет доказанного влияния на стресс.\n\n"
-        "📌 *О проекте:*\n"
-        "Данный бот разработан в рамках республиканской научно-практической "
-        "конференции школьников «Первые шаги в науку» (2026 год).\n"
-        "Автор: Алексей Евгеньевич К., СОШ 9.\n"
-        "\n"
-        "версия: 0.3.6\n"
+        "Выбери практику:",
+        reply_markup=build_practices_kb()
     )
 
-# ========== ВЕЧЕРНИЙ ОПРОС ПО РАСПИСАНИЮ ==========
-async def send_poll_to_user(user_id: int):
-    if has_today_mood(user_id):
+@dp.callback_query(lambda c: c.data and c.data.startswith('practice_'))
+async def process_practice_choice(callback: CallbackQuery, state: FSMContext):
+    practice_id = int(callback.data.split('_')[1])
+    practice_info = get_practice_info(practice_id)
+    if not practice_info:
+        await callback.answer("Практика не найдена.")
         return
-    current_state = await dp.fsm.storage.get_state(chat=user_id)
-    if current_state and current_state.startswith('EveningPoll'):
+    name, description, points = practice_info
+
+    if not can_complete_practice(callback.from_user.id, practice_id):
+        await callback.message.edit_text("Ты уже выполнял эту практику сегодня. Возвращайся завтра!")
+        await callback.answer()
         return
-    await dp.fsm.storage.set_state(chat=user_id, state=EveningPoll.q1)
-    await dp.fsm.storage.set_data(chat=user_id, data={'answers': [], 'first_poll': False})
-    q = PollQuestions.questions[0]
-    try:
-        await bot.send_message(
-            chat_id=user_id,
-            text=f"🌆 Вечерний опрос (1/{POLL_QUESTIONS_COUNT}):\n{q['text']}\n_{q['hint']}_",
-            parse_mode="Markdown",
-            reply_markup=build_poll_kb()
+
+    if practice_id == 1:
+        await callback.message.edit_text(
+            f"*{name}*\n\n{description}\n\nПришли фото того, чем ты занимаешься (например, процесс вязания).",
+            parse_mode="Markdown"
         )
-    except Exception as e:
-        logging.error(f"Не удалось отправить опрос пользователю {user_id}: {e}")
+        await state.set_state(PracticeStates.practice1_waiting_photo)
+        await state.update_data(practice_id=1, points=points)
+    elif practice_id == 5:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Выбрать букву самому", callback_data="letter_self")],
+            [InlineKeyboardButton(text="Пусть бот выберет", callback_data="letter_bot")]
+        ])
+        await callback.message.edit_text(
+            f"*{name}*\n\n{description}\n\nКак хочешь выбрать букву?",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        await state.set_state(PracticeStates.practice5_choose_letter)
+        await state.update_data(practice_id=5, points=points)
+    elif practice_id == 9:
+        task = get_practice9_task(callback.from_user.id)
+        if task is None:
+            await callback.message.edit_text("Ты уже выполнял это задание сегодня. Возвращайся завтра!")
+            await callback.answer()
+            return
+        await callback.message.edit_text(
+            f"*{name}*\n\n{description}\n\nСегодняшнее задание: {task}\n\nВыполнил(а)?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Да", callback_data="practice9_done")]
+            ])
+        )
+        await state.set_state(PracticeStates.practice9_confirm)
+        await state.update_data(practice_id=9, points=points)
+    else:
+        await callback.answer("Практика в разработке")
+    await callback.answer()
 
-async def scheduled_polls():
-    now = datetime.now(MOSCOW_TZ).strftime("%H:%M")
-    users = get_users_by_poll_time(now)
-    for uid in users:
-        await send_poll_to_user(uid)
+@dp.message(PracticeStates.practice1_waiting_photo, F.photo)
+async def practice1_photo_received(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    practice_id = data['practice_id']
+    points = data['points']
+    user_id = message.from_user.id
 
-# ========== УТРЕННЯЯ РАССЫЛКА ПО ИНДИВИДУАЛЬНОМУ ВРЕМЕНИ ==========
-async def send_morning_pic(user_id: int):
-    if not image_files:
+    mark_practice_completed(user_id, practice_id, points)
+    await message.answer("Спасибо! Твоя практика засчитана. Продолжай в том же духе 🌟")
+    await state.clear()
+
+@dp.message(PracticeStates.practice1_waiting_photo)
+async def practice1_waiting_photo_invalid(message: types.Message):
+    await message.answer("Пожалуйста, отправь фотографию.")
+
+@dp.callback_query(PracticeStates.practice5_choose_letter, lambda c: c.data in ['letter_self', 'letter_bot'])
+async def practice5_choose_method(callback: CallbackQuery, state: FSMContext):
+    if callback.data == 'letter_self':
+        await callback.message.edit_text("Напиши букву (одну), которую хочешь выбрать:")
+        await state.set_state(PracticeStates.practice5_enter_letter)
+    else:
+        letter = random.choice('абвгдеёжзийклмнопрстуфхцчшщъыьэюя')
+        await state.update_data(letter=letter)
+        await callback.message.edit_text(
+            f"Бот выбрал букву: *{letter.upper()}*\n\n"
+            "Теперь напиши три слова на эту букву через пробел (например, 'книга кот карта').",
+            parse_mode="Markdown"
+        )
+        await state.set_state(PracticeStates.practice5_waiting_words)
+    await callback.answer()
+
+@dp.message(PracticeStates.practice5_enter_letter)
+async def practice5_enter_letter(message: types.Message, state: FSMContext):
+    letter = message.text.strip().lower()
+    if len(letter) != 1 or not letter.isalpha():
+        await message.answer("Пожалуйста, введи одну букву.")
         return
-    try:
-        img_path = random.choice(image_files)
-        photo = FSInputFile(img_path)
-        caption = "Доброе утро! Хорошего дня ☀️"
-        await bot.send_photo(chat_id=user_id, photo=photo, caption=caption)
-    except Exception as e:
-        logging.error(f"Не удалось отправить картинку {user_id}: {e}")
+    await state.update_data(letter=letter)
+    await message.answer(
+        f"Твоя буква: *{letter.upper()}*\n\n"
+        "Теперь напиши три слова на эту букву через пробел (например, 'книга кот карта').",
+        parse_mode="Markdown"
+    )
+    await state.set_state(PracticeStates.practice5_waiting_words)
 
-async def scheduled_morning():
-    now = datetime.now(MOSCOW_TZ).strftime("%H:%M")
-    users = get_users_by_morning_time(now)
-    for uid in users:
-        await send_morning_pic(uid)
+@dp.message(PracticeStates.practice5_waiting_words)
+async def practice5_check_words(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    letter = data['letter']
+    practice_id = data['practice_id']
+    points = data['points']
+    user_id = message.from_user.id
 
-# ========== ОБЩАЯ УТРЕННЯЯ РАССЫЛКА В 7:30 ==========
-async def send_morning_to_all():
-    users = get_all_users()
-    for uid in users:
-        if image_files:
-            img_path = random.choice(image_files)
-            photo = FSInputFile(img_path)
-            caption = "Доброе утро! Хорошего дня ☀️"
-            try:
-                await bot.send_photo(chat_id=uid, photo=photo, caption=caption)
-            except Exception as e:
-                logging.error(f"Не удалось отправить картинку {uid}: {e}")
-        else:
-            # если картинок нет, отправляем факт
-            if facts_day:
-                fact = random.choice(facts_day)
-                await bot.send_message(uid, f"📌 Доброе утро!\n{fact}")
-
-# ========== ДНЕВНАЯ РАССЫЛКА ФАКТОВ В 13:30 ==========
-async def send_daily_fact_to_all():
-    if not facts_day:
+    words = message.text.strip().lower().split()
+    if len(words) != 3:
+        await message.answer("Нужно написать ровно три слова через пробел. Попробуй ещё раз.")
         return
-    users = get_all_users()
-    fact = random.choice(facts_day)
-    for uid in users:
-        try:
-            await bot.send_message(uid, f"📌 Интересный факт о стрессе:\n{fact}")
-        except Exception as e:
-            logging.error(f"Не удалось отправить факт {uid}: {e}")
+
+    if all(w.startswith(letter) for w in words):
+        mark_practice_completed(user_id, practice_id, points)
+        await message.answer("Отлично! Твоя практика засчитана. 🎉")
+        await state.clear()
+    else:
+        await message.answer(f"Не все слова начинаются с буквы '{letter.upper()}'. Попробуй ещё раз.")
+
+@dp.callback_query(PracticeStates.practice9_confirm, lambda c: c.data == 'practice9_done')
+async def practice9_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    practice_id = data['practice_id']
+    points = data['points']
+    user_id = callback.from_user.id
+
+    mark_practice_completed(user_id, practice_id, points)
+    await callback.message.edit_text("Супер! Твоя практика засчитана. Продолжай быть собой 🌟")
+    await state.clear()
+    await callback.answer()
 
 # ========== ОБРАБОТКА ОТВЕТОВ НА ОПРОС ==========
 @dp.callback_query(lambda c: c.data and c.data.startswith('poll_'))
@@ -1068,7 +1288,6 @@ async def handle_poll_answer(callback: CallbackQuery, state: FSMContext):
                 f"Спасибо за самооценку! Ты можешь пройти основной опрос вечером."
             )
             update_quick_test_time(user_id)
-            await callback.message.answer("+10 очков за экспресс-тест! ⚡")
         else:
             if zone == 'green':
                 feedback = "Красавчик/Красотка! Ты в балансе. Поддерживай этот вайб ✨"
@@ -1115,20 +1334,90 @@ async def handle_poll_answer(callback: CallbackQuery, state: FSMContext):
         )
     await callback.answer()
 
+# ========== ВЕЧЕРНИЙ ОПРОС ПО РАСПИСАНИЮ ==========
+async def send_poll_to_user(user_id: int):
+    if has_today_mood(user_id):
+        logging.info(f"Пользователь {user_id} уже проходил опрос сегодня")
+        return
+    current_state = await dp.fsm.storage.get_state(chat=user_id)
+    if current_state and current_state.startswith('EveningPoll'):
+        logging.info(f"У пользователя {user_id} уже активен опрос")
+        return
+    logging.info(f"Отправляем опрос пользователю {user_id}")
+    await dp.fsm.storage.set_state(chat=user_id, state=EveningPoll.q1)
+    await dp.fsm.storage.set_data(chat=user_id, data={'answers': [], 'first_poll': False})
+    q = PollQuestions.questions[0]
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=f"🌆 Вечерний опрос (1/{POLL_QUESTIONS_COUNT}):\n{q['text']}\n_{q['hint']}_",
+            parse_mode="Markdown",
+            reply_markup=build_poll_kb()
+        )
+        logging.info(f"Опрос успешно отправлен пользователю {user_id}")
+    except Exception as e:
+        logging.error(f"Не удалось отправить опрос пользователю {user_id}: {e}")
+
+async def scheduled_polls():
+    now = datetime.now(MOSCOW_TZ).strftime("%H:%M")
+    users = get_users_by_poll_time(now)
+    logging.info(f"Проверка времени {now}: найдено пользователей с poll_time={now}: {users}")
+    for uid in users:
+        await send_poll_to_user(uid)
+
+# ========== УТРЕННЯЯ РАССЫЛКА ==========
+async def send_morning_pic(user_id: int):
+    if not image_files:
+        return
+    try:
+        img_path = random.choice(image_files)
+        photo = FSInputFile(img_path)
+        caption = "Доброе утро! Хорошего дня ☀️"
+        await bot.send_photo(chat_id=user_id, photo=photo, caption=caption)
+    except Exception as e:
+        logging.error(f"Не удалось отправить картинку {user_id}: {e}")
+
+async def scheduled_morning():
+    now = datetime.now(MOSCOW_TZ).strftime("%H:%M")
+    users = get_users_by_morning_time(now)
+    for uid in users:
+        await send_morning_pic(uid)
+
+async def send_morning_to_all():
+    users = get_all_users()
+    for uid in users:
+        if image_files:
+            img_path = random.choice(image_files)
+            photo = FSInputFile(img_path)
+            caption = "Доброе утро! Хорошего дня ☀️"
+            try:
+                await bot.send_photo(chat_id=uid, photo=photo, caption=caption)
+            except Exception as e:
+                logging.error(f"Не удалось отправить картинку {uid}: {e}")
+        else:
+            if facts_day:
+                fact = random.choice(facts_day)
+                await bot.send_message(uid, f"📌 Доброе утро!\n{fact}")
+
+async def send_daily_fact_to_all():
+    if not facts_day:
+        return
+    users = get_all_users()
+    fact = random.choice(facts_day)
+    for uid in users:
+        try:
+            await bot.send_message(uid, f"📌 Интересный факт о стрессе:\n{fact}")
+        except Exception as e:
+            logging.error(f"Не удалось отправить факт {uid}: {e}")
+
 # ========== ПЛАНИРОВЩИК ==========
 def setup_scheduler():
-    # Индивидуальные рассылки
     scheduler.add_job(scheduled_polls, trigger="interval", minutes=1)
     scheduler.add_job(scheduled_morning, trigger="interval", minutes=1)
-
-    # Общая утренняя рассылка в 7:30
     trigger_morning = CronTrigger(hour=7, minute=30, timezone='Europe/Moscow')
     scheduler.add_job(send_morning_to_all, trigger_morning, id='morning_to_all')
-
-    # Дневная рассылка фактов в 13:30
     trigger_fact = CronTrigger(hour=13, minute=30, timezone='Europe/Moscow')
     scheduler.add_job(send_daily_fact_to_all, trigger_fact, id='daily_fact')
-
     scheduler.start()
 
 # ========== ЗАПУСК ==========
