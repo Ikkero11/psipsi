@@ -9,7 +9,7 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = os.environ["BOT_TOKEN"]
+TOKEN  = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
 
 # ═══════════════════════════════════════════════════════
 #  ПАЦИЕНТЫ  (курсовой формат — несколько визитов)
